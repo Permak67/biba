@@ -1,0 +1,145 @@
+#include <Servo.h> 
+
+// --- ПИНЫ УПРАВЛЕНИЯ КУЛЕРОМ (КАНАЛ B L298N) ---
+const int FAN_EN_B = 10;   // Пин ШИМ для скорости (ENB)
+const int FAN_IN_3 = 5;    // IN3
+const int FAN_IN_4 = 4;    // IN4
+const int FAN_TACH_PIN = 2; // Пин для чтения RPM
+
+// --- ПИН СЕРВОПРИВОДА ---
+const int SERVO_PIN = 6; 
+
+// --- ОБЪЕКТЫ И ПЕРЕМЕННЫЕ ---
+Servo myServo; 
+volatile int pulseCount = 0; 
+unsigned long lastReadTime = 0; 
+
+// --- ПЕРЕМЕННЫЕ ДЛЯ РЕЖИМОВ СЕРВО ---
+int currentAngle = 90; 
+int targetAngle = 90;  
+int angleDirection = 1; 
+unsigned long lastMoveTime = 0; 
+const int moveDelay = 10; // Скорость серво: 10 мс на 1 градус
+
+// Режимы: 0 = Остановлен/Ручной, 1 = Качание (0-180), 2 = Плавное движение к S[угол]
+int servoMode = 0; 
+
+void setup() {
+  // !!! КОРРЕКТИРОВКА ЧАСТОТЫ ШИМ ДЛЯ КУЛЕРА (ПИН D10) !!!
+  // Эта строка меняет базовую частоту 490 Гц на 31.25 кГц. 
+  // Это помогает 3-пиновым кулерам работать на разных скоростях через L298N.
+  TCCR1B = (TCCR1B & 0b11111000) | 0x01; 
+
+  Serial.begin(9600);
+  Serial.println("System Ready. Commands: F[0-255], R, M1 (swing), M0 (stop), S[0-180] (move slow)");
+
+  // Настройка пинов L298N для кулера
+  pinMode(FAN_EN_B, OUTPUT);
+  pinMode(FAN_IN_3, OUTPUT);
+  pinMode(FAN_IN_4, OUTPUT);
+  digitalWrite(FAN_IN_3, HIGH); 
+  digitalWrite(FAN_IN_4, LOW);
+  analogWrite(FAN_EN_B, 0); 
+
+  // Настройка пина тахометра и прерываний
+  pinMode(FAN_TACH_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), rpm_fun, RISING);
+
+  // Подключение сервопривода
+  myServo.attach(SERVO_PIN);
+  myServo.write(currentAngle); 
+}
+
+void loop() {
+  // 1. ОБРАБОТКА КОМАНД ЧЕРЕЗ SERIAL PORT
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input.length() > 0) {
+        char commandType = input.charAt(0); 
+        int value = input.substring(1).toInt();
+
+        if (commandType == 'F' || commandType == 'f') {
+          if (value >= 0 && value <= 255) {
+            // Логика минимальной скорости кулера (чтобы он начал крутиться)
+            int actual_speed = value;
+            if (value > 0 && value < 10) {
+                actual_speed = 10; 
+            }
+            analogWrite(FAN_EN_B, actual_speed); 
+            Serial.print("Fan Speed set to: "); Serial.println(actual_speed);
+          }
+        } else if (commandType == 'S' || commandType == 's') {
+          if (value >= 0 && value <= 180) {
+            targetAngle = value;
+            servoMode = 2; // Режим плавного движения к цели
+            Serial.print("Moving slowly to angle: "); Serial.println(targetAngle);
+          }
+        } else if (commandType == 'R' || commandType == 'r') {
+          printRPM();
+        } else if (commandType == 'M' || commandType == 'm') {
+          if (value == 1) {
+            servoMode = 1; // Режим качания (swing)
+            Serial.println("Swing mode M1 activated.");
+          } else if (value == 0) {
+            servoMode = 0; // Режим остановки/ручной
+            Serial.println("Servo stopped (M0).");
+          }
+        }
+    }
+  }
+
+  // 2. УПРАВЛЕНИЕ СЕРВОПРИВОДОМ НА ОСНОВЕ ТЕКУЩЕГО РЕЖИМА
+  // Скорость регулируется через moveDelay = 10 мс
+  if (millis() - lastMoveTime >= moveDelay) {
+    lastMoveTime = millis();
+    bool moved = false; 
+
+    if (servoMode == 1) {
+      currentAngle += angleDirection;
+      if (currentAngle <= 0 || currentAngle >= 180) {
+        angleDirection *= -1; 
+      }
+      moved = true;
+      
+    } else if (servoMode == 2) {
+      if (currentAngle < targetAngle) {
+        currentAngle++;
+        moved = true;
+      } else if (currentAngle > targetAngle) {
+        currentAngle--;
+        moved = true;
+      } else {
+        servoMode = 0; 
+        Serial.println("Target reached. Switched to M0 mode.");
+      }
+    }
+    
+    if (moved) {
+      myServo.write(currentAngle);
+    }
+  }
+
+  // 3. АВТОМАТИЧЕСКОЕ ЧТЕНИЕ RPM КАЖДЫЕ 2 СЕКУНДЫ
+  if (millis() - lastReadTime >= 2000) { 
+    printRPM();
+    lastReadTime = millis();
+  }
+}
+
+void rpm_fun() {
+  pulseCount++;
+}
+
+void printRPM() {
+    detachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN)); 
+    long timeElapsed = millis() - lastReadTime;
+    if (timeElapsed > 0) {
+      long calculatedRPM = (pulseCount / 2) * (60000 / timeElapsed);
+      Serial.print("Current RPM: ");
+      Serial.println(calculatedRPM);
+    }
+    pulseCount = 0; 
+    attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), rpm_fun, RISING);
+}
